@@ -710,14 +710,10 @@ def switch_to_traveller(
 def replace_tick_with_shift(tokens: list[Token], i: int, node: ast.Call) -> None:
     """Replace tick method call with shift, adding default argument of 1 if no args."""
     # Find the position of the "tick" method name
-    while i < len(tokens) and not (
+    while i < len(tokens)-1 and not (
         tokens[i].name == "NAME" and tokens[i].src == "tick"
     ):
         i += 1
-
-    # Safety check to not go out of bounds
-    if i >= len(tokens):
-        return
 
     # Replace "tick" with "shift"
     tokens[i] = Token(name="NAME", src="shift")
