@@ -54,7 +54,6 @@ class State:
     freeze_time_decorators: list[ast.Call] = field(default_factory=list)
     freeze_time_with_statements: list[ast.Call] = field(default_factory=list)
     pytest_mark_decorators: list[ast.Call] = field(default_factory=list)
-    auto_tick_seconds_calls: list[ast.Call] = field(default_factory=list)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -183,8 +182,7 @@ def collect_migration_state(tree: ast.Module) -> State:
             for decorator in node.decorator_list:
                 if is_migratable_freeze_time_call(decorator, state):
                     state.freeze_time_decorators.append(decorator)
-                    # Check if this decorator has tick or auto_tick_seconds argument
-                    has_auto_tick_seconds = False
+                    # Check if this decorator has tick argument
                     for keyword in decorator.keywords:
                         if keyword.arg == "tick":
                             has_decorator_with_tick = True
@@ -193,17 +191,10 @@ def collect_migration_state(tree: ast.Module) -> State:
                                 if hasattr(keyword.value, "value")
                                 else False
                             )
-                        elif keyword.arg == "auto_tick_seconds":
-                            has_decorator_with_tick = True
-                            decorator_tick_value = True  # auto_tick_seconds implies tick=True
-                            has_auto_tick_seconds = True
-                    if has_auto_tick_seconds:
-                        state.auto_tick_seconds_calls.append(decorator)
                 elif is_pytest_mark_freeze_time(decorator):
                     state.pytest_mark_decorators.append(decorator)
                     has_pytest_mark = True
-                    # Check if this decorator has tick or auto_tick_seconds argument
-                    has_auto_tick_seconds = False
+                    # Check if this decorator has tick argument
                     for keyword in decorator.keywords:
                         if keyword.arg == "tick":
                             has_decorator_with_tick = True
@@ -212,12 +203,6 @@ def collect_migration_state(tree: ast.Module) -> State:
                                 if hasattr(keyword.value, "value")
                                 else False
                             )
-                        elif keyword.arg == "auto_tick_seconds":
-                            has_decorator_with_tick = True
-                            decorator_tick_value = True  # auto_tick_seconds implies tick=True
-                            has_auto_tick_seconds = True
-                    if has_auto_tick_seconds:
-                        state.auto_tick_seconds_calls.append(decorator)
 
             # Track functions that have decorators with tick arguments
             if has_decorator_with_tick:
@@ -250,7 +235,6 @@ def collect_migration_state(tree: ast.Module) -> State:
 
                         # Extract tick value from context manager
                         context_tick_value = None
-                        has_auto_tick_seconds = False
                         for keyword in context_expr.keywords:
                             if keyword.arg == "tick":
                                 context_tick_value = (
@@ -259,13 +243,6 @@ def collect_migration_state(tree: ast.Module) -> State:
                                     else False
                                 )
                                 break
-                            elif keyword.arg == "auto_tick_seconds":
-                                context_tick_value = True  # auto_tick_seconds implies tick=True
-                                has_auto_tick_seconds = True
-                                break
-
-                        if has_auto_tick_seconds:
-                            state.auto_tick_seconds_calls.append(context_expr)
 
                         if context_tick_value is not None:
                             context_var_tick_values[context_var_name] = (
@@ -331,11 +308,6 @@ def collect_migration_state(tree: ast.Module) -> State:
                 for decorator in node.decorator_list:
                     if is_migratable_freeze_time_call(decorator, state):
                         state.freeze_time_decorators.append(decorator)
-                        # Check for auto_tick_seconds in class decorator
-                        for keyword in decorator.keywords:
-                            if keyword.arg == "auto_tick_seconds":
-                                state.auto_tick_seconds_calls.append(decorator)
-                                break
 
         elif isinstance(node, ast.With):
             for item in node.items:
@@ -347,11 +319,6 @@ def collect_migration_state(tree: ast.Module) -> State:
                     and is_migratable_freeze_time_call(context_expr, state)
                 ):
                     state.freeze_time_with_statements.append(context_expr)
-                    # Check for auto_tick_seconds in with statement
-                    for keyword in context_expr.keywords:
-                        if keyword.arg == "auto_tick_seconds":
-                            state.auto_tick_seconds_calls.append(context_expr)
-                            break
 
     return state
 
@@ -469,12 +436,6 @@ def generate_callbacks(state: State) -> Mapping[Offset, list[TokenFunc]]:
             partial(add_tick_false, node=context_expr)
         )
 
-    # Handle auto_tick_seconds parameter conversion
-    for call in state.auto_tick_seconds_calls:
-        ret[ast_start_offset(call)].append(
-            partial(convert_auto_tick_seconds_to_tick, node=call)
-        )
-
     return ret
 
 
@@ -542,10 +503,10 @@ TokenFunc = Callable[[list[Token], int], None]
 def migratable_call(node: ast.Call) -> bool:
     return (
         len(node.args) == 1
-        # Allow tick and auto_tick_seconds keyword arguments
+        # Allow tick keyword argument, we handle it properly in add_tick_false
         and (
             len(node.keywords) == 0
-            or (len(node.keywords) == 1 and node.keywords[0].arg in ("tick", "auto_tick_seconds"))
+            or (len(node.keywords) == 1 and node.keywords[0].arg == "tick")
         )
     )
 
@@ -777,8 +738,8 @@ def add_tick_false(tokens: list[Token], i: int, node: ast.Call) -> None:
     """
     Add `tick=False` to the function call if it doesn't already have a tick argument.
     """
-    # Check if the node already has a tick or auto_tick_seconds keyword argument
-    has_tick_arg = any(keyword.arg in ("tick", "auto_tick_seconds") for keyword in node.keywords)
+    # Check if the node already has a tick keyword argument
+    has_tick_arg = any(keyword.arg == "tick" for keyword in node.keywords)
 
     if not has_tick_arg:
         j = find_last_token(tokens, i, node=node)
@@ -791,52 +752,13 @@ def add_tick_value(
     """
     Add `tick=True` or `tick=False` to the function call based on the tick_value.
     """
-    # Check if the node already has a tick or auto_tick_seconds keyword argument
-    has_tick_arg = any(keyword.arg in ("tick", "auto_tick_seconds") for keyword in node.keywords)
+    # Check if the node already has a tick keyword argument
+    has_tick_arg = any(keyword.arg == "tick" for keyword in node.keywords)
 
     if not has_tick_arg:
         j = find_last_token(tokens, i, node=node)
         tick_str = "True" if tick_value else "False"
         tokens.insert(j, Token(name=CODE, src=f", tick={tick_str}"))
-
-
-def convert_auto_tick_seconds_to_tick(tokens: list[Token], i: int, node: ast.Call) -> None:
-    """
-    Convert `auto_tick_seconds=X` parameter to `tick=True`.
-    """
-    # Find the auto_tick_seconds parameter and replace it with tick=True
-    j = i
-    while j < len(tokens):
-        if tokens[j].name == "NAME" and tokens[j].src == "auto_tick_seconds":
-            # Replace "auto_tick_seconds" with "tick"
-            tokens[j] = Token(name="NAME", src="tick")
-            
-            # Find the value after the equals sign and replace with "True"
-            k = j + 1
-            while k < len(tokens) and tokens[k].src != "=":
-                k += 1
-            k += 1  # Move past the equals sign
-            
-            # Skip whitespace
-            while k < len(tokens) and tokens[k].name in ("UNIMPORTANT_WS", "NL"):
-                k += 1
-            
-            # Find the end of the parameter value
-            start_value = k
-            paren_count = 0
-            while k < len(tokens):
-                if tokens[k].src in ("(", "[", "{"):
-                    paren_count += 1
-                elif tokens[k].src in (")", "]", "}"):
-                    paren_count -= 1
-                elif tokens[k].src in (",", ")") and paren_count == 0:
-                    break
-                k += 1
-            
-            # Replace the value with "True"
-            tokens[start_value:k] = [Token(name="NAME", src="True")]
-            break
-        j += 1
 
 
 # Token functions
